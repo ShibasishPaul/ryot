@@ -1,0 +1,189 @@
+name: Sync upstream and build ryot-full
+
+# This is the only workflow that actually runs in this fork day-to-day.
+# Upstream's own "Main"/"Website" workflows are copied along with every file
+# on the `main` mirror branch but are deliberately left DISABLED in this
+# fork's Actions settings, so they never fire (see fork-tooling/README.md).
+#
+# What this does, in order, every run:
+#   1. Fast-forwards `main` to upstream/main - but ONLY if both safety checks
+#      below pass. `main` never diverges from upstream by even one commit.
+#   2. Safety check A: does patches/apply-pro-license-bypass.sh still apply
+#      cleanly against upstream's latest code?
+#   3. Safety check B: has upstream's own .github/workflows/*.yml changed
+#      since our last reviewed baseline (baseline/*.yml in this branch)?
+#   4. If either check fails: open/update a tracking issue and stop. Nothing
+#      is merged, nothing is built, main is untouched.
+#   5. If both pass: fast-forward main, mirror any new upstream tags, then
+#      build the ONE image this fork produces - ghcr.io/<owner>/ryot-full -
+#      from a patched worktree applied fresh at build time. No ryot/ryot-pro
+#      images, no Docker Hub.
+
+on:
+  schedule:
+    - cron: "17 4 * * *" # daily; arbitrary off-peak minute to avoid GH's on-the-hour thundering herd
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  issues: write
+  packages: write
+
+env:
+  UPSTREAM_REPO: https://github.com/IgnisDa/ryot.git
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/ryot-full
+
+jobs:
+  sync-check-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork-tooling
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configure git identity
+        run: |
+          git config user.name "ryot-fork-sync[bot]"
+          git config user.email "ryot-fork-sync@users.noreply.github.com"
+
+      - name: Fetch upstream and our own main
+        run: |
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch upstream main --tags
+          git fetch origin main
+
+      - name: Safety check A - does the license-bypass patch still apply?
+        id: patch_check
+        run: |
+          rm -rf /tmp/patch-check
+          git worktree add /tmp/patch-check upstream/main
+          chmod +x patches/apply-pro-license-bypass.sh
+          if ./patches/apply-pro-license-bypass.sh /tmp/patch-check; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+          git worktree remove --force /tmp/patch-check
+
+      - name: Safety check B - did upstream's own workflow files change?
+        id: workflow_check
+        run: |
+          CHANGED=false
+          for f in main.yml website.yml; do
+            if ! git show upstream/main:.github/workflows/$f 2>/dev/null | diff -q - "baseline/$f" > /dev/null 2>&1; then
+              echo "::warning::upstream .github/workflows/$f differs from our reviewed baseline"
+              CHANGED=true
+            fi
+          done
+          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
+
+      - name: Open or update the review-needed issue
+        if: steps.patch_check.outputs.ok != 'true' || steps.workflow_check.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TITLE="Sync blocked: manual review needed"
+          BODY="Automated sync from upstream (IgnisDa/ryot) did not proceed.\n\n"
+          if [ "${{ steps.patch_check.outputs.ok }}" != "true" ]; then
+            BODY="${BODY}- **License-bypass patch no longer applies.** upstream likely renamed/changed the signature of \`get_is_server_key_validated\`. Update \`patches/apply-pro-license-bypass.sh\` against the new code, verify it, then re-run this workflow.\n"
+          fi
+          if [ "${{ steps.workflow_check.outputs.changed }}" == "true" ]; then
+            BODY="${BODY}- **Upstream changed its own .github/workflows/*.yml.** Review the diff, decide whether our sync-and-build.yml assumptions (Dockerfile path, build steps, secrets) still hold, then update \`baseline/*.yml\` in this branch to the new upstream content once reviewed, so this check passes again.\n"
+          fi
+          BODY="${BODY}\nUntil this is resolved, \`main\` stays exactly where it is and no new \`ryot-full\` image is built."
+          EXISTING=$(gh issue list --state open --search "in:title \"$TITLE\"" --json number --jq '.[0].number')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "$BODY"
+          else
+            gh issue create --title "$TITLE" --body "$BODY"
+          fi
+          exit 1
+
+      - name: Fast-forward main to upstream and push
+        run: |
+          git checkout main
+          git merge --ff-only upstream/main
+          git push origin main
+          git push origin --tags
+
+      - name: Set up worktree and apply the patch
+        run: |
+          rm -rf /tmp/ryot-full-build
+          git worktree add /tmp/ryot-full-build main
+          chmod +x patches/apply-pro-license-bypass.sh
+          ./patches/apply-pro-license-bypass.sh /tmp/ryot-full-build
+
+      # From here down this mirrors upstream's own build-transactional +
+      # build-backend jobs (main.yml in baseline/) minus the arch matrix
+      # (amd64 only - baudhi.cc is x86_64) and minus Docker Hub. Faithfully
+      # replicating their real pipeline is more robust than a hand-simplified
+      # one, since it's already proven to produce a working image.
+      - name: Set up Node.js and caching
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24"
+          cache: "yarn"
+          cache-dependency-path: /tmp/ryot-full-build/yarn.lock
+
+      - name: Build email templates
+        working-directory: /tmp/ryot-full-build
+        run: |
+          yarn install --immutable
+          npm install -g turbo@2.8.10
+          yarn turbo run build --filter=@ryot/transactional
+          yarn workspace @ryot/transactional copy-templates
+
+      - name: Extract rust toolchain channel
+        id: toolchain
+        working-directory: /tmp/ryot-full-build
+        run: echo "channel=$(grep channel rust-toolchain.toml | awk -F' = ' '{printf $2}' | tr -d '\"')" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@0b1efabc08b657293548b77fb76cc02d26091c7e
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Install cross
+        uses: taiki-e/cache-cargo-install-action@b8c5be6c3fb064f797977463ac00b01844751632
+        with:
+          tool: cross
+          git: https://github.com/cross-rs/cross
+          rev: 51f46f296253d8122c927c5bb933e3c4f27cc317
+          locked: false
+
+      - name: Cross-build the backend
+        working-directory: /tmp/ryot-full-build
+        env:
+          # Compile-time only (Rust's env!() macro) - not sensitive, since the
+          # patched get_is_server_key_validated() never sends this anywhere.
+          UNKEY_ROOT_KEY: "unused-license-check-patched-see-patches-dir"
+          APP_VERSION: "fork-${{ github.run_id }}"
+        run: cross build --locked --target x86_64-unknown-linux-gnu --release
+
+      - name: Arrange build artifact for the Dockerfile
+        run: |
+          mkdir -p /tmp/ryot-full-build/artifact/backend-amd64
+          cp /tmp/ryot-full-build/target/x86_64-unknown-linux-gnu/release/backend \
+             /tmp/ryot-full-build/artifact/backend-amd64/backend
+
+      - name: Log in to GHCR
+        uses: docker/login-action@28fdb31ff34708d19615a74d67103ddc2ea9725c
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@65d18f8f8a05aab1b2d761032bec9cd5578caadb
+
+      - name: Build and push ryot-full (amd64 only)
+        uses: docker/build-push-action@9e436ba9f2d7bcd1d038c8e55d039d37896ddc5d
+        with:
+          context: /tmp/ryot-full-build
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:sha-${{ github.sha }}

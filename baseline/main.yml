@@ -1,0 +1,322 @@
+name: Main
+
+on:
+  push:
+    branches: ["main"]
+    tags:
+      - "*-?v[0-9]+*"
+  pull_request:
+    branches: ["main"]
+    types: [opened, synchronize]
+
+permissions:
+  contents: read
+
+env:
+  GHCR_REGISTRY: ghcr.io
+  DOCKER_USERNAME: ignisda
+
+jobs:
+  pre-workflow-checks:
+    runs-on: ubuntu-latest
+    outputs:
+      should-run: ${{ steps.set_outputs.outputs.should-run }}
+      image-names: ${{ steps.set_outputs.outputs.image-names }}
+      should-release: ${{ steps.set_outputs.outputs.should-release }}
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Set outputs
+        id: set_outputs
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        with:
+          script: |
+            const repositoryName = context.payload.repository.name;
+            const owner = context.repo.owner;
+            const ghcrRegistry = process.env.GHCR_REGISTRY;
+            const dockerUsername = process.env.DOCKER_USERNAME;
+
+            let imageNames = [
+              `name=${dockerUsername}/${repositoryName}`,
+              `name=${ghcrRegistry}/${owner}/${repositoryName}`,
+              `name=${dockerUsername}/${repositoryName}-pro`,
+              `name=${ghcrRegistry}/${owner}/${repositoryName}-pro`,
+            ];
+
+            let shouldRun = 'false';
+            if (context.eventName === "push") {
+              shouldRun = 'true';
+            } else if (context.eventName === "pull_request") {
+              const commitMsg = await github.rest.repos.getCommit({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: context.payload.pull_request.head.sha
+              }).then(commit => commit.data.commit.message);
+              if (commitMsg.includes("Run CI")) {
+                shouldRun = 'true';
+              }
+            }
+
+            core.setOutput('should-run', shouldRun);
+
+            const shouldRelease = (context.eventName === "push" && context.ref.startsWith("refs/tags/")) ? 'true' : 'false';
+            core.setOutput('should-release', shouldRelease);
+
+            core.setOutput('image-names', imageNames.join('\n'));
+
+  create-release:
+    needs:
+      - pre-workflow-checks
+    if: needs.pre-workflow-checks.outputs.should-release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Generate changelog
+        id: changelog
+        uses: metcalfc/changelog-generator@e5a31a2994bada7f5892d75974bd70e10ef983a7
+        with:
+          myToken: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create Release
+        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b
+        with:
+          body: |
+            ## What's Changed
+            ${{ steps.changelog.outputs.changelog }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-transactional:
+    needs: pre-workflow-checks
+    if: needs.pre-workflow-checks.outputs.should-run == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
+        with:
+          persist-credentials: false
+      - name: Set up Node.js and caching
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24"
+          cache: "yarn"
+      - name: Install dependencies
+        run: yarn install --immutable
+      - name: Build emails
+        run: yarn turbo run build --filter=@ryot/transactional
+      - name: Copy templates to crates
+        run: yarn workspace @ryot/transactional copy-templates
+      - name: Upload templates artifact
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4
+        with:
+          name: templates
+          retention-days: 1
+          path: |
+            crates/services/notification/templates/
+
+  build-backend:
+    needs:
+      - pre-workflow-checks
+      - build-transactional
+    if: needs.pre-workflow-checks.outputs.should-run == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - target: x86_64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          name: templates
+          path: crates/services/notification/templates/
+      - name: Extract build information
+        id: build
+        env:
+          TARGET: ${{ matrix.platform.target }}
+        run: |
+          echo "version=${GITHUB_REF##*/}" >> "$GITHUB_OUTPUT"
+          echo "docker-arch=${{ startsWith(matrix.platform.target, 'x86_64') && 'amd64' || 'arm64' }}" >> "$GITHUB_OUTPUT"
+      - name: Extract rust toolchain
+        id: toolchain
+        run: |
+          echo "channel=$(grep channel rust-toolchain.toml | awk -F' = ' '{printf $2}' | tr -d '"')" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@0b1efabc08b657293548b77fb76cc02d26091c7e
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          targets: ${{ matrix.platform.target }}
+      - uses: Swatinem/rust-cache@42c55942cfd355e94e6864616f4dbb3392bd2789
+        with:
+          key: ${{ matrix.platform.target }}-${{ steps.build.outputs.profile }}
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: target
+          key: cargo-build-${{ runner.os }}-${{ matrix.platform.target }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-build-${{ runner.os }}-${{ matrix.platform.target }}-
+      - name: Install cross
+        uses: taiki-e/cache-cargo-install-action@b8c5be6c3fb064f797977463ac00b01844751632
+        with:
+          tool: cross
+          git: https://github.com/cross-rs/cross
+          rev: 51f46f296253d8122c927c5bb933e3c4f27cc317
+          locked: false
+      - name: Build
+        env:
+          UNKEY_ROOT_KEY: ${{ secrets.UNKEY_ROOT_KEY }}
+          APP_VERSION: ${{ steps.build.outputs.version }}
+        run: |
+          cross build --locked --target ${{ matrix.platform.target }} --release
+      - name: Upload build artifact
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4
+        with:
+          name: backend-${{ steps.build.outputs.docker-arch }}
+          path: ${{ github.workspace }}/target/${{ matrix.platform.target }}/release/backend
+          retention-days: 1
+
+  build-docker:
+    needs:
+      - pre-workflow-checks
+      - build-backend
+    if: needs.pre-workflow-checks.outputs.should-run == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
+        with:
+          persist-credentials: false
+      - name: Download build artifact for docker
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          path: ${{ github.workspace }}/artifact/
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@65d18f8f8a05aab1b2d761032bec9cd5578caadb
+      - name: Log in to the ghcr container registry
+        uses: docker/login-action@28fdb31ff34708d19615a74d67103ddc2ea9725c
+        continue-on-error: true
+        with:
+          registry: ${{ env.GHCR_REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Log in to the docker hub container registry
+        uses: docker/login-action@28fdb31ff34708d19615a74d67103ddc2ea9725c
+        continue-on-error: true
+        with:
+          username: ${{ env.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051
+        with:
+          images: ${{ needs.pre-workflow-checks.outputs.image-names }}
+          tags: |
+            type=ref,event=pr
+            type=raw,value=develop,enable={{is_default_branch}}
+            type=semver,pattern=v{{version}},enable=${{ needs.pre-workflow-checks.outputs.should-release == 'true' }}
+            type=semver,pattern=v{{major}}.{{minor}},enable=${{ needs.pre-workflow-checks.outputs.should-release == 'true' }}
+            type=semver,pattern=v{{major}},enable=${{ needs.pre-workflow-checks.outputs.should-release == 'true' }}
+            type=raw,value=latest,enable=${{ needs.pre-workflow-checks.outputs.should-release == 'true' }}
+            type=sha
+      - name: Build and push
+        uses: docker/build-push-action@9e436ba9f2d7bcd1d038c8e55d039d37896ddc5d
+        with:
+          context: .
+          push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+
+  upload-kodi-plugin:
+    needs:
+      - pre-workflow-checks
+      - build-docker
+    if: needs.pre-workflow-checks.outputs.should-release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
+        with:
+          persist-credentials: false
+      - name: Build plugin
+        run: apps/kodi/ci/build-plugin.sh
+      - name: Upload plugin to releases
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: gh release upload --clobber "${REF_NAME}" "tmp/script.ryot.zip"
+
+  upload-browser-extensions:
+    needs:
+      - pre-workflow-checks
+      - build-docker
+    if: needs.pre-workflow-checks.outputs.should-release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
+        with:
+          persist-credentials: false
+      - name: Set up Node.js and caching
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24"
+          cache: "yarn"
+      - name: Install dependencies
+        run: yarn install --immutable
+      - name: Build browser extensions
+        run: yarn turbo run build --filter=@ryot/browser-extension
+      - name: Upload browser extensions to releases
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          gh release upload --clobber "${REF_NAME}" apps/browser-extension/dist/*.zip
+
+  deploy-docs:
+    needs:
+      - pre-workflow-checks
+      - build-docker
+    if: needs.pre-workflow-checks.outputs.should-release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
+        with:
+          persist-credentials: false
+      - name: Set up Node.js and caching
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24"
+          cache: "yarn"
+      - name: Install dependencies
+        run: yarn install --immutable
+      - name: Build documentation
+        run: yarn turbo run build --filter=@ryot/docs
+      - name: Push to deployment branch
+        uses: peaceiris/actions-gh-pages@4f9cc6602d3f66b9c108549d475ec49e8ef4d45e
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: apps/docs/.vitepress/dist
+          publish_branch: nf-docs
+          force_orphan: true
