@@ -103,7 +103,7 @@ jobs:
 
       - name: Fast-forward main to upstream and push
         run: |
-          git checkout main
+          git checkout -B main origin/main
           git merge --ff-only upstream/main
           git push origin main
           git push origin --tags
