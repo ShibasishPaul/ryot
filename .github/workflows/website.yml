@@ -1,0 +1,11 @@
+# Placeholder - see main.yml in this same directory and README.md. Disabling
+# this stub suppresses upstream's real website.yml on the `main` branch too,
+# since GitHub tracks enable/disable state per workflow path, not per branch.
+name: Website (disabled placeholder - see README.md)
+on:
+  workflow_dispatch: {}
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "This workflow is intentionally disabled. See README.md."

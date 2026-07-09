@@ -1,0 +1,15 @@
+# Placeholder. This path is real content on the `main` branch (an untouched
+# mirror of upstream's own .github/workflows/main.yml) - this stub exists only
+# so GitHub registers a workflow at this path on the default branch, which we
+# then disable via `gh workflow disable`. GitHub Actions' enable/disable state
+# is tracked per workflow path repo-wide, not per branch content, so disabling
+# this stub also suppresses upstream's real version of this file on `main`.
+# See README.md.
+name: Main (disabled placeholder - see README.md)
+on:
+  workflow_dispatch: {}
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "This workflow is intentionally disabled. See README.md."
