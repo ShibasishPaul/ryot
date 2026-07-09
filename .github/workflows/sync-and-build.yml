@@ -31,7 +31,6 @@ permissions:
 
 env:
   UPSTREAM_REPO: https://github.com/IgnisDa/ryot.git
-  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/ryot-full
 
 jobs:
   sync-check-and-build:
@@ -47,6 +46,13 @@ jobs:
         run: |
           git config user.name "ryot-fork-sync[bot]"
           git config user.email "ryot-fork-sync@users.noreply.github.com"
+
+      - name: Compute lowercase image name
+        # GHCR/Docker require lowercase repository names, but
+        # github.repository_owner preserves the account's actual casing
+        # (ShibasishPaul) - the env: block can't call functions, so compute
+        # it here instead.
+        run: echo "IMAGE_NAME=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/ryot-full" >> "$GITHUB_ENV"
 
       - name: Fetch upstream and our own main
         run: |
