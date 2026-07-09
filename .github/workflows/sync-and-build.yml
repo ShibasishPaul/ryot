@@ -127,12 +127,13 @@ jobs:
       # (amd64 only - baudhi.cc is x86_64) and minus Docker Hub. Faithfully
       # replicating their real pipeline is more robust than a hand-simplified
       # one, since it's already proven to produce a working image.
-      - name: Set up Node.js and caching
+      - name: Set up Node.js
+        # No yarn cache here (setup-node's cache-dependency-path can't resolve
+        # paths outside $GITHUB_WORKSPACE, and our build tree is a worktree
+        # under /tmp) - a speed nicety, not a correctness requirement.
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "24"
-          cache: "yarn"
-          cache-dependency-path: /tmp/ryot-full-build/yarn.lock
 
       - name: Build email templates
         working-directory: /tmp/ryot-full-build
