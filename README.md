@@ -44,12 +44,20 @@ Runs daily (and on manual dispatch). Every run:
 
 ## Why upstream's own `Main`/`Website` workflows are disabled
 
-They're copied onto `main` unmodified (since `main` is a pure mirror) but are
-turned off in this fork's Actions settings, because pushing to `main` would
-otherwise trigger them using upstream's original, unpatched pipeline - which
-would fail anyway (no `DOCKER_TOKEN`/Docker Hub access in this fork, and the
-unpatched code needs a real `UNKEY_ROOT_KEY`). `sync-and-build.yml` is the
-only workflow that actually needs to run here.
+They're copied onto `main` unmodified (since `main` is a pure mirror), and
+pushing to `main` would otherwise trigger them using upstream's original,
+unpatched pipeline - which would fail anyway (no `DOCKER_TOKEN`/Docker Hub
+access in this fork, and the unpatched code needs a real `UNKEY_ROOT_KEY`),
+just noisily. GitHub's workflow enable/disable state is tracked per
+*workflow path*, repo-wide - not per branch content - so this branch
+(`fork-tooling`, the default branch) carries placeholder stubs at the exact
+same paths (`.github/workflows/main.yml`, `website.yml`), which were
+registered once GitHub scanned this branch and then disabled via
+`gh workflow disable main.yml` / `website.yml`. That disabled state applies
+to *any* content at those paths on *any* branch, including upstream's real
+version on `main` - confirmed via `gh workflow list --all` showing both as
+`disabled_manually`. `sync-and-build.yml` is the only workflow that actually
+runs here.
 
 ## Scope note
 
