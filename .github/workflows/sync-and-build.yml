@@ -102,10 +102,17 @@ jobs:
           exit 1
 
       - name: Fast-forward main to upstream and push
+        # Deliberately not `git checkout main` here - the primary checkout
+        # stays on fork-tooling throughout, so `main` remains free for the
+        # worktree used to build ryot-full below (git refuses to check out
+        # the same branch in two worktrees at once).
         run: |
-          git checkout -B main origin/main
-          git merge --ff-only upstream/main
-          git push origin main
+          if ! git merge-base --is-ancestor origin/main upstream/main; then
+            echo "::error::origin/main is not an ancestor of upstream/main - main has diverged unexpectedly. Refusing to force-update."
+            exit 1
+          fi
+          git update-ref refs/heads/main upstream/main
+          git push origin main:main
           git push origin --tags
 
       - name: Set up worktree and apply the patch
